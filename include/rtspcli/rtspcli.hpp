@@ -108,6 +108,11 @@ namespace rtspcli
     // TEARDOWN and stop the receive thread. Idempotent; never call from a callback.
     void stop();
 
+    // Thread-safe, callable from any thread while open()/play() are blocked on
+    // the network: makes them fail within about a second, ends playback, and
+    // makes later open()/play() calls fail until stop() is called.
+    void interrupt();
+
     bool running() const; // whether the receive thread is alive
     const std::vector<stream_info> &streams() const;
     std::string last_error() const;

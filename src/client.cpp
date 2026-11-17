@@ -171,6 +171,7 @@ namespace rtspcli
     std::thread thr;
     std::atomic<bool> stop_flag{false};
     std::atomic<bool> run_flag{false};
+    std::atomic<bool> interrupted{false}; // interrupt(): cleared by client::stop()
 
     mutable std::mutex err_mu;
     std::string err;
@@ -183,6 +184,7 @@ namespace rtspcli
     uint64_t ibuf_total = 0;           // total interleaved bytes received
     std::vector<out_frame> frames_tmp; // reused by handle_channel to avoid churn
     bool has_get_parameter = false;
+    bool conn_broken = false; // receive loop ended on a transport error
     int keepalive_ms = 25000;
     steady_clock::time_point last_data, last_keepalive;
 
@@ -207,7 +209,17 @@ namespace rtspcli
     }
     static size_t on_header(char *p, size_t s, size_t n, void *u)
     {
-      static_cast<impl *>(u)->header_buf.append(p, s * n);
+      auto *im = static_cast<impl *>(u);
+      // With Basic/Digest auth libcurl performs two exchanges for one request
+      // (401, then the authenticated retry) and reports both. Keep only the
+      // final response, so header_value() and the SDP body cannot pick up
+      // fields from the 401.
+      if (s * n >= 5 && std::memcmp(p, "RTSP/", 5) == 0)
+      {
+        im->header_buf.clear();
+        im->body_buf.clear();
+      }
+      im->header_buf.append(p, s * n);
       return s * n;
     }
     static size_t on_interleave(void *p, size_t s, size_t n, void *u)
@@ -221,7 +233,8 @@ namespace rtspcli
     }
     static int on_progress(void *u, curl_off_t, curl_off_t, curl_off_t, curl_off_t)
     {
-      return static_cast<impl *>(u)->stop_flag.load() ? 1 : 0;
+      const auto *im = static_cast<impl *>(u);
+      return (im->stop_flag.load() || im->interrupted.load()) ? 1 : 0;
     }
 
     CURLcode do_request(long req, const std::string &uri, long timeout_ms,
@@ -448,8 +461,11 @@ namespace rtspcli
       do_stop();
       ensure_curl_init();
       stop_flag = false;
+      conn_broken = false;
       opt = o;
       set_err({});
+      if (interrupted)
+        return fail("interrupted");
       streams.clear();
       infos.clear();
       chan_map.fill(-1);
@@ -584,6 +600,8 @@ namespace rtspcli
     {
       if (!opened)
         return fail("play() before successful open()");
+      if (interrupted)
+        return fail("interrupted");
       if (run_flag)
         return true;
 
@@ -638,7 +656,12 @@ namespace rtspcli
         pos = comma + 1;
       }
 
+      // A receive thread that ended on its own (stream error) is finished but
+      // still joinable; assigning a new std::thread over it would terminate().
+      if (thr.joinable())
+        thr.join();
       stop_flag = false;
+      conn_broken = false;
       run_flag = true;
       last_data = last_keepalive = steady_clock::now();
       thr = std::thread([this]
@@ -649,6 +672,7 @@ namespace rtspcli
     void run_loop()
     {
       std::string reason;
+      bool broken = false; // transport failure, as opposed to media inactivity
       int empty_spins = 0;
       while (!stop_flag)
       {
@@ -662,7 +686,9 @@ namespace rtspcli
           break;
         if (rc == CURLE_OPERATION_TIMEDOUT)
         {
+          // not a single byte (not even RTCP) for the whole timeout
           reason = "stream idle timeout (no data)";
+          broken = true;
           break;
         }
         if (rc == CURLE_ABORTED_BY_CALLBACK)
@@ -670,6 +696,7 @@ namespace rtspcli
         if (rc != CURLE_OK)
         {
           reason = std::string("receive: ") + curl_easy_strerror(rc);
+          broken = true;
           break;
         }
         // defensive: back off briefly if spinning without data
@@ -686,7 +713,22 @@ namespace rtspcli
           empty_spins = 0;
         }
 
+        // RECEIVE returns CURLE_OK right away when nothing is pending, so
+        // CURLOPT_TIMEOUT_MS alone never trips once the server goes quiet or
+        // closes the socket: check both explicitly.
+        curl_socket_t sock = CURL_SOCKET_BAD;
+        if (curl_easy_getinfo(curl, CURLINFO_ACTIVESOCKET, &sock) == CURLE_OK && sock == CURL_SOCKET_BAD)
+        {
+          reason = "connection closed by server";
+          broken = true;
+          break;
+        }
         const auto now = steady_clock::now();
+        if (opt.idle_timeout_ms > 0 && now - last_data > std::chrono::milliseconds(opt.idle_timeout_ms))
+        {
+          reason = "stream idle timeout (no data)";
+          break;
+        }
         if (now - last_keepalive > std::chrono::milliseconds(keepalive_ms))
         {
           last_keepalive = now;
@@ -695,10 +737,14 @@ namespace rtspcli
           if (krc != CURLE_OK && !stop_flag)
           {
             reason = std::string("keepalive: ") + curl_easy_strerror(krc);
+            broken = true;
             break;
           }
         }
       }
+      // TEARDOWN would only block on a dead connection. When just the media
+      // stopped (RTP idle, connection still up) it still frees the server session.
+      conn_broken = broken;
       run_flag = false;
       if (!reason.empty() && !stop_flag)
       {
@@ -715,17 +761,17 @@ namespace rtspcli
       {
         if (thr.get_id() == std::this_thread::get_id())
         {
-          thr.detach(); // called from the callback thread (forbidden by docs): avoid self-join
+          // Called from a callback: the receive loop exits once the callback
+          // returns. The thread and the curl handle are still in use, so leave
+          // joining and cleanup to the next stop()/destructor on another thread.
+          return;
         }
-        else
-        {
-          thr.join();
-        }
+        thr.join();
       }
       if (curl)
       {
         stop_flag = false; // otherwise the progress callback would abort TEARDOWN itself
-        if (opened)
+        if (opened && !conn_broken && !interrupted)
           do_request(CURL_RTSPREQ_TEARDOWN, agg_url, 3000); // best effort
         curl_easy_cleanup(curl);
         curl = nullptr;
@@ -747,7 +793,12 @@ namespace rtspcli
 
   bool client::open(const options &opt) { return impl_->do_open(opt); }
   bool client::play() { return impl_->do_play(); }
-  void client::stop() { impl_->do_stop(); }
+  void client::stop()
+  {
+    impl_->do_stop();
+    impl_->interrupted = false;
+  }
+  void client::interrupt() { impl_->interrupted = true; }
 
   bool client::running() const { return impl_->run_flag.load(); }
   const std::vector<stream_info> &client::streams() const { return impl_->infos; }

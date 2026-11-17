@@ -1,5 +1,6 @@
 #include "depack.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstdlib>
 #include <cstring>
@@ -44,6 +45,36 @@ namespace rtspcli
           fn(buf.data() + start, n - start);
       }
 
+      // Byte length of a leading access unit delimiter (start code included) in an
+      // AU assembled by the depacketizers below, or 0 if the AU does not start
+      // with one. Parameter sets must be inserted after it: an AUD has to be the
+      // first NAL of its access unit. Only 4-byte start codes are ever written
+      // into an AU, and emulation prevention rules out 00 00 00 01 inside a NAL.
+      size_t leading_aud_size(const std::vector<uint8_t> &au, bool h265)
+      {
+        if (au.size() < 5)
+          return 0;
+        const bool aud = h265 ? ((au[4] >> 1) & 0x3F) == 35 : (au[4] & 0x1F) == 9;
+        if (!aud)
+          return 0;
+        static const uint8_t sc[4] = {0, 0, 0, 1};
+        auto it = std::search(au.begin() + 5, au.end(), sc, sc + 4);
+        return size_t(it - au.begin());
+      }
+
+      // Prepends the cached parameter sets to an IRAP access unit (after its AUD).
+      std::vector<uint8_t> with_param_sets(const std::vector<uint8_t> &au,
+                                           const std::vector<uint8_t> &params, bool h265)
+      {
+        const size_t at = leading_aud_size(au, h265);
+        std::vector<uint8_t> v;
+        v.reserve(au.size() + params.size());
+        v.insert(v.end(), au.begin(), au.begin() + at);
+        v.insert(v.end(), params.begin(), params.end());
+        v.insert(v.end(), au.begin() + at, au.end());
+        return v;
+      }
+
       struct bit_reader
       {
         const uint8_t *d;
@@ -83,16 +114,24 @@ namespace rtspcli
         {
           if (pkt.payload_size < 1)
             return;
-          if (have_seq && uint16_t(pkt.seq - last_seq) != 1)
+          const bool gap = have_seq && uint16_t(pkt.seq - last_seq) != 1;
+          last_seq = pkt.seq;
+          have_seq = true;
+          if (gap)
           {
-            damaged = true;
             fu.clear();
             fu_active = false;
           }
-          last_seq = pkt.seq;
-          have_seq = true;
           if (au_active && pkt.timestamp != au_ts)
+          {
+            // The previous AU never saw its marker packet, so the loss covers
+            // at least its tail; it may also cover the head of this one.
+            if (gap)
+              damaged = true;
             flush(out);
+          }
+          if (gap)
+            damaged = true;
           au_ts = pkt.timestamp;
           au_active = true;
 
@@ -187,10 +226,7 @@ namespace rtspcli
             f.rtp_timestamp = au_ts;
             f.key = au_has_idr;
             if (au_has_idr && !au_has_sps && !param_blob.empty())
-            {
-              f.data = param_blob;
-              f.data.insert(f.data.end(), au.begin(), au.end());
-            }
+              f.data = with_param_sets(au, param_blob, false);
             else
             {
               f.data = std::move(au);
@@ -223,16 +259,24 @@ namespace rtspcli
         {
           if (pkt.payload_size < 2)
             return;
-          if (have_seq && uint16_t(pkt.seq - last_seq) != 1)
+          const bool gap = have_seq && uint16_t(pkt.seq - last_seq) != 1;
+          last_seq = pkt.seq;
+          have_seq = true;
+          if (gap)
           {
-            damaged = true;
             fu.clear();
             fu_active = false;
           }
-          last_seq = pkt.seq;
-          have_seq = true;
           if (au_active && pkt.timestamp != au_ts)
+          {
+            // The previous AU never saw its marker packet, so the loss covers
+            // at least its tail; it may also cover the head of this one.
+            if (gap)
+              damaged = true;
             flush(out);
+          }
+          if (gap)
+            damaged = true;
           au_ts = pkt.timestamp;
           au_active = true;
 
@@ -331,10 +375,7 @@ namespace rtspcli
             f.rtp_timestamp = au_ts;
             f.key = au_has_irap;
             if (au_has_irap && !au_has_sps && !param_blob.empty())
-            {
-              f.data = param_blob;
-              f.data.insert(f.data.end(), au.begin(), au.end());
-            }
+              f.data = with_param_sets(au, param_blob, true);
             else
             {
               f.data = std::move(au);
@@ -358,12 +399,14 @@ namespace rtspcli
       {
       public:
         aac_depack(const std::map<std::string, std::string> &fmtp, const std::vector<uint8_t> &config,
-                   bool adts)
+                   int sample_rate, int channels, bool adts)
         {
           size_len = fmtp_int(fmtp, "sizelength", 13);
           index_len = fmtp_int(fmtp, "indexlength", 3);
           index_delta_len = fmtp_int(fmtp, "indexdeltalength", 3);
           parse_asc(config);
+          if (!asc_valid)
+            guess_asc(sample_rate, channels);
           use_adts = adts && asc_valid && aot >= 1 && aot <= 4 && freq_idx != 15;
         }
 
@@ -412,6 +455,11 @@ namespace rtspcli
             return;
           }
           uint32_t ts = pkt.timestamp;
+          if (sizes.empty())
+          { // no AU headers (sizelength=0): the payload is a single AU
+            emit(data, dn, ts, out);
+            return;
+          }
           size_t off = 0;
           for (size_t sz : sizes)
           {
@@ -441,6 +489,27 @@ namespace rtspcli
           if (br.avail(1))
             samples_per_frame = br.read(1) ? 960 : 1024; // frameLengthFlag
           asc_valid = true;
+        }
+
+        // Some servers omit fmtp "config". Assume AAC-LC and take the sample rate
+        // (RTP clock) and channel count from a=rtpmap, so ADTS still works.
+        void guess_asc(int sample_rate, int channels)
+        {
+          static const int rates[13] = {96000, 88200, 64000, 48000, 44100, 32000, 24000,
+                                        22050, 16000, 12000, 11025, 8000, 7350};
+          for (int i = 0; i < 13; ++i)
+          {
+            // channel_configuration 1..6 is that many channels and 7 is 7.1 (8
+            // channels); 7 channels has no configuration and needs a PCE.
+            if (rates[i] == sample_rate && ((channels >= 1 && channels <= 6) || channels == 8))
+            {
+              aot = 2;
+              freq_idx = i;
+              chan_cfg = channels == 8 ? 7 : channels;
+              asc_valid = true;
+              return;
+            }
+          }
         }
 
         void emit(const uint8_t *d, size_t n, uint32_t ts, std::vector<out_frame> &out)
@@ -784,7 +853,8 @@ namespace rtspcli
       case codec_type::aac:
         if (info.encoding_name == "MP4A-LATM")
           return std::make_unique<latm_depack>();
-        return std::make_unique<aac_depack>(fmtp, info.codec_data, aac_to_adts);
+        return std::make_unique<aac_depack>(fmtp, info.codec_data, info.clock_rate, info.channels,
+                                            aac_to_adts);
       case codec_type::pcmu:
       case codec_type::pcma:
       case codec_type::l16:

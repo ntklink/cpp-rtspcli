@@ -223,7 +223,8 @@ namespace rtspcli
         return -1;
       };
       std::vector<uint8_t> out;
-      int acc = 0, bits = 0;
+      uint32_t acc = 0; // only the low 14 bits are ever needed; masking keeps the shift defined
+      int bits = 0;
       for (char c : s)
       {
         int v = val(c);
@@ -233,7 +234,7 @@ namespace rtspcli
             break;
           continue; // skip whitespace
         }
-        acc = (acc << 6) | v;
+        acc = ((acc << 6) | uint32_t(v)) & 0x3FFF;
         bits += 6;
         if (bits >= 8)
         {

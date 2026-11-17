@@ -76,6 +76,7 @@ ffplay dump_0.h264
 ## Notes
 
 - Frame callbacks run on an internal thread; keep them light (enqueue, don't decode inline). Never call `stop()` from a callback.
+- `interrupt()` is thread-safe and aborts a blocking `open()`/`play()` within about a second (e.g. for a fast shutdown); call `stop()` afterwards before reusing the client.
 - Pull-only (PLAY), TCP interleaved only (no UDP). No PAUSE/seek/RECORD.
 - Inter-stream sync uses the RTP-Info anchor from PLAY; RTCP SR is not parsed.
 - L16 frames are 16-bit signed big-endian PCM as received from the wire.
